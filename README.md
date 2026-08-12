@@ -44,6 +44,17 @@ cd herdr-remote/relay && ./start.sh
 
 Open [herdr-demo.pages.dev](https://herdr-demo.pages.dev) on your phone, paste the tunnel URL.
 
+### Windows 11 relay
+
+`herdr_relay.py` now runs directly on Windows 11. Start it from PowerShell:
+
+```powershell
+$env:HERDR_BIN = "herdr"   # or full path to herdr.exe if it is not on PATH
+uv run relay/herdr_relay.py
+```
+
+If you want remote phone access on Windows, run `cloudflared tunnel --url http://localhost:8375` in a second PowerShell window. `relay/start.sh` remains Unix-only.
+
 ## Telegram Bot
 
 For an automatically restarting relay and Telegram bot:
@@ -131,10 +142,30 @@ uv run relay/herdr_relay.py
 ## Requirements
 
 - macOS 14+ (menu bar app)
-- Python 3.10+ with [uv](https://docs.astral.sh/uv/) (relay/TUI/bot)
+- Python 3.10+ with [uv](https://docs.astral.sh/uv/) (relay/TUI/bot, including Windows 11 for the relay)
 - `cloudflared` (for remote access)
 - herdr 0.7+
 - Zero-dep plugin: [`herdr-push`](https://github.com/dcolinmorgan/herdr-push)
+
+## Python install without `uv`
+
+On Debian, Ubuntu, and other PEP 668 environments, install into a local virtualenv from the repo root:
+
+```bash
+python3 -m venv .venv
+. .venv/bin/activate
+python -m pip install -r requirements.txt
+python relay/herdr_relay.py
+```
+
+`requirements.txt` includes the shared Python dependencies for the relay, Telegram bot, and TUI.
+
+You can also use the Make targets:
+
+```bash
+make relay-venv
+make relay-run
+```
 
 ## Changelog
 

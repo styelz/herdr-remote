@@ -4,7 +4,7 @@
 # dependencies = ["websockets>=14.0", "zeroconf>=0.80.0", "pywebpush>=2.0.0", "py-vapid>=1.9.0"]
 # ///
 """herdr-remote relay — polls herdr, accepts push events (HTTP POST + WebSocket + UDP), broadcasts to clients."""
-import asyncio, json, logging, os, re, shutil, signal, socket, subprocess, time
+import asyncio, json, logging, ntpath, os, re, shutil, signal, socket, subprocess, sys, time
 
 from agent_state import complete_agent_update_message
 
@@ -15,11 +15,20 @@ except ImportError:
 from websockets.exceptions import ConnectionClosedError, ConnectionClosedOK
 
 from logging.handlers import RotatingFileHandler
-import sys
+
+
+def _windows_state_dir():
+    root = os.environ.get("LOCALAPPDATA") or os.environ.get("APPDATA")
+    if root:
+        return ntpath.join(root, "herdr-remote")
+    return ntpath.join(os.path.expanduser("~"), "AppData", "Local", "herdr-remote")
+
 
 def _get_log_dir():
     if sys.platform == "darwin":
         return os.path.expanduser("~/Library/Logs/herdr-remote")
+    if sys.platform == "win32":
+        return ntpath.join(_windows_state_dir(), "log")
     if os.path.isdir("/var/log") and os.access("/var/log", os.W_OK):
         return "/var/log/herdr-remote"
     return os.path.expanduser("~/.local/state/herdr-remote/log")
@@ -41,7 +50,12 @@ log.addHandler(_file_handler)
 log.addHandler(_console_handler)
 logging.getLogger("websockets").setLevel(logging.WARNING)
 
-HERDR = os.environ.get("HERDR_BIN") or shutil.which("herdr") or "/opt/homebrew/bin/herdr"
+HERDR = (
+    os.environ.get("HERDR_BIN")
+    or shutil.which("herdr")
+    or shutil.which("herdr.exe")
+    or "herdr"
+)
 WS_PORT = int(os.environ.get("HERDR_RELAY_PORT", "8375"))
 POLL_INTERVAL = 2
 AUTH_TOKEN = os.environ.get("HERDR_RELAY_TOKEN", "")  # Optional: shared secret for relay auth
@@ -171,6 +185,30 @@ def run_herdr(*args, remote=None):
         return run_herdr_result(*args, remote=remote).stdout.strip()
     except Exception:
         return ""
+
+
+def configure_event_loop_policy():
+    if sys.platform == "win32" and hasattr(asyncio, "WindowsSelectorEventLoopPolicy"):
+        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+
+
+def _detect_bind_ip():
+    probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        probe.connect(("8.8.8.8", 80))
+        return probe.getsockname()[0]
+    except OSError:
+        return "127.0.0.1"
+    finally:
+        probe.close()
+
+
+def install_signal_handlers(loop, stop):
+    if sys.platform == "win32":
+        return False
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        loop.add_signal_handler(sig, stop.set_result, None)
+    return True
 
 
 def get_agents_from_host(remote=None):
@@ -568,12 +606,11 @@ class UDPPlugin(asyncio.DatagramProtocol):
 def start_mdns():
     try:
         from zeroconf import Zeroconf, ServiceInfo
-        import socket as sock_mod
         import threading
-        ip = sock_mod.gethostbyname(sock_mod.gethostname())
+        ip = _detect_bind_ip()
         info = ServiceInfo(
             "_herdr-remote._tcp.local.", "herdr-remote._herdr-remote._tcp.local.",
-            addresses=[sock_mod.inet_aton(ip)], port=WS_PORT,
+            addresses=[socket.inet_aton(ip)], port=WS_PORT,
         )
         zc = Zeroconf()
         threading.Thread(target=zc.register_service, args=(info,), daemon=True).start()
@@ -587,25 +624,37 @@ def start_mdns():
 async def main():
     zc, info = start_mdns()
     loop = asyncio.get_running_loop()
+    server = None
     try:
-        await loop.create_datagram_endpoint(UDPPlugin, local_addr=("127.0.0.1", 8376))
-    except OSError:
-        log.warning("UDP 8376 in use, plugin push disabled")
-    asyncio.create_task(poll_loop())
-    asyncio.create_task(event_push())
-    server = await serve(handle_client, "0.0.0.0", WS_PORT, process_request=process_request)
-    hosts = ["local"] + REMOTES
-    log.info("herdr-remote relay on :%d (WebSocket + HTTP POST)", WS_PORT)
-    log.info("Polling: %s", ", ".join(hosts))
-    stop = loop.create_future()
-    for sig in (signal.SIGINT, signal.SIGTERM):
-        loop.add_signal_handler(sig, stop.set_result, None)
-    await stop
-    server.close()
-    if zc and info:
-        zc.unregister_service(info)
-        zc.close()
+        try:
+            await loop.create_datagram_endpoint(UDPPlugin, local_addr=("127.0.0.1", 8376))
+        except OSError:
+            log.warning("UDP 8376 in use, plugin push disabled")
+        except NotImplementedError:
+            log.warning("UDP plugin push unavailable on this event loop")
+        asyncio.create_task(poll_loop())
+        asyncio.create_task(event_push())
+        server = await serve(handle_client, "0.0.0.0", WS_PORT, process_request=process_request)
+        hosts = ["local"] + REMOTES
+        log.info("herdr-remote relay on :%d (WebSocket + HTTP POST)", WS_PORT)
+        log.info("Polling: %s", ", ".join(hosts))
+        stop = loop.create_future()
+        if install_signal_handlers(loop, stop):
+            await stop
+        else:
+            await asyncio.Future()
+    finally:
+        if server is not None:
+            server.close()
+            await server.wait_closed()
+        if zc and info:
+            zc.unregister_service(info)
+            zc.close()
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    configure_event_loop_policy()
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        pass
